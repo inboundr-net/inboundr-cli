@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { describeError, GLOBAL_FLAGS, makeContext, parse, type Command } from "./command.js";
+import { describeError, GLOBAL_FLAGS, hoistGlobalFlags, makeContext, parse, type Command } from "./command.js";
 import { login, logout, status } from "./commands/auth.js";
 import {
   emailsAttachment,
@@ -21,7 +21,7 @@ import {
   threadsGet,
 } from "./commands/resources.js";
 import { CliError, UsageError } from "./errors.js";
-import { bold, dim, note, print, red, setColor } from "./output.js";
+import { bold, dim, note, print, red, safe, setColor } from "./output.js";
 import { VERSION } from "./version.js";
 
 const COMMANDS: Command[] = [
@@ -103,8 +103,13 @@ function find(argv: string[]): { command?: Command; group?: string; rest: string
   return { command, rest: argv.slice(1) };
 }
 
-export async function main(argv: string[]): Promise<number> {
-  if (argv.includes("--no-color")) setColor(false);
+export async function main(input: string[]): Promise<number> {
+  if (input.includes("--no-color")) setColor(false);
+  const { argv, hasCommand } = hoistGlobalFlags(input);
+  if (!hasCommand) {
+    print(rootHelp());
+    return 0;
+  }
   const first = argv[0];
   if (first === undefined || first === "help" || first === "--help" || first === "-h") {
     const topic = first === "help" && argv[1] ? find(argv.slice(1)) : undefined;
@@ -148,7 +153,8 @@ export async function main(argv: string[]): Promise<number> {
       if (err.message) note(red(err.message));
       return err.exitCode;
     }
-    note(red(describeError(err)));
+    // API error messages are the server's words; still not ours to trust.
+    note(red(safe(describeError(err))));
     return 1;
   }
 }

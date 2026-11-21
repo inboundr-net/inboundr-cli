@@ -4,6 +4,7 @@ import { readConfig, type Config } from "./config.js";
 import { CliError, UsageError } from "./errors.js";
 
 type Options = NonNullable<ParseArgsConfig["options"]>;
+type FetchLike = NonNullable<Exclude<ConstructorParameters<typeof Inboundr>[0], string | undefined>["fetch"]>;
 
 export type Command = {
   /** "emails list", "listen", … */
@@ -25,8 +26,12 @@ export type Context = {
   values: Values;
   args: string[];
   json: boolean;
-  /** The API client, built on first use from flags, env and saved config. */
-  client(): Promise<Inboundr>;
+  /**
+   * The API client, built on first use from flags, env and saved config.
+   * `fetch` swaps in a wrapper (listen uses it to make Ctrl-C cancel
+   * requests); a client built with one isn't cached.
+   */
+  client(options?: { fetch?: FetchLike }): Promise<Inboundr>;
   config(): Promise<Config>;
 };
 
@@ -46,6 +51,39 @@ export const GLOBAL_FLAGS: [string, string][] = [
   ["--no-color", "No colour (also NO_COLOR=1)"],
   ["-h, --help", "Show help"],
 ];
+
+/**
+ * Moves global flags given before the command to after it, so
+ * `inboundr --json emails list` means `inboundr emails list --json`.
+ * Returns the reordered argv and whether anything but globals was given.
+ */
+export function hoistGlobalFlags(argv: string[]): { argv: string[]; hasCommand: boolean } {
+  const leading: string[] = [];
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i]!;
+    if (arg === "--json" || arg === "--no-color") {
+      leading.push(arg);
+      i++;
+      continue;
+    }
+    const valued = /^--(api-key|base-url)(=.*)?$/.exec(arg);
+    if (valued) {
+      if (valued[2] !== undefined) {
+        leading.push(arg);
+        i++;
+      } else {
+        // A flag missing its value is left for the command's parser to report.
+        leading.push(arg, ...argv.slice(i + 1, i + 2));
+        i += 2;
+      }
+      continue;
+    }
+    break;
+  }
+  const rest = argv.slice(i);
+  return { argv: [...rest, ...leading], hasCommand: rest.length > 0 };
+}
 
 export function parse(command: Command, argv: string[]): { values: Values; args: string[] } {
   let parsed;
@@ -96,21 +134,20 @@ export function makeContext(values: Values, args: string[]): Context {
   let config: Promise<Config> | undefined;
   let client: Promise<Inboundr> | undefined;
   const getConfig = () => (config ??= readConfig());
+  const build = (fetch?: FetchLike) =>
+    getConfig().then((cfg) => {
+      const { apiKey, baseUrl } = resolveCredentials(values, cfg);
+      if (!apiKey) {
+        throw new CliError("No API key. Run inboundr login, or set INBOUNDR_API_KEY.");
+      }
+      return new Inboundr({ apiKey, ...(baseUrl ? { baseUrl } : {}), ...(fetch ? { fetch } : {}) });
+    });
   return {
     values,
     args,
     json: values.json === true,
     config: getConfig,
-    client: () =>
-      (client ??= getConfig().then((cfg) => {
-        const { apiKey, baseUrl } = resolveCredentials(values, cfg);
-        if (!apiKey) {
-          throw new CliError(
-            "No API key. Run inboundr login, or set INBOUNDR_API_KEY.",
-          );
-        }
-        return new Inboundr({ apiKey, ...(baseUrl ? { baseUrl } : {}) });
-      })),
+    client: (options) => (options?.fetch ? build(options.fetch) : (client ??= build())),
   };
 }
 

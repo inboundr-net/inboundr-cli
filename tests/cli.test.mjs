@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
-import { createServer } from "node:http";
+import { spawn as spawnChild } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -9,6 +9,30 @@ import { verifyWebhookDeliveryPayload } from "inboundr";
 import { API_KEY, makeEmail, startFakeApi } from "./fake-api.mjs";
 
 const CLI = new URL("../dist/cli.js", import.meta.url).pathname;
+
+// Everything a test starts is stopped when the file ends, pass or fail. A
+// failed assertion skips a test's own cleanup, and one `listen` left running
+// keeps the runner waiting forever: CI would hang instead of failing.
+const children = new Set();
+const servers = new Set();
+function spawn(...args) {
+  const child = spawnChild(...args);
+  children.add(child);
+  child.on("close", () => children.delete(child));
+  return child;
+}
+function createServer(...args) {
+  const server = createHttpServer(...args);
+  servers.add(server);
+  return server;
+}
+after(() => {
+  for (const child of children) child.kill("SIGKILL");
+  for (const server of servers) {
+    server.closeAllConnections?.();
+    server.close(() => {});
+  }
+});
 let api;
 let configDir;
 
@@ -246,4 +270,142 @@ test("listen reports a server that isn't running and keeps going", async () => {
   assert.equal(line.emailId, email.id);
   assert.equal(line.status, null);
   assert.match(line.error, /connection refused/);
+});
+
+/** Starts `inboundr listen` and returns helpers to wait on and stop it. */
+function startListen(args, envExtra) {
+  const child = spawn(process.execPath, [CLI, "listen", ...args], { env: env(envExtra) });
+  const out = { stdout: "", stderr: "" };
+  child.stdout.on("data", (d) => (out.stdout += d));
+  child.stderr.on("data", (d) => (out.stderr += d));
+  const exited = new Promise((r) => child.on("close", r));
+  const until = async (cond, ms = 8000) => {
+    const end = Date.now() + ms;
+    while (!cond()) {
+      if (Date.now() > end) throw new Error(`timed out\nstdout: ${out.stdout}\nstderr: ${out.stderr}`);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  return { child, out, exited, until };
+}
+
+async function freePort() {
+  const probe = createServer();
+  await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+  const { port } = probe.address();
+  await new Promise((r) => probe.close(r));
+  return port;
+}
+
+test("escape sequences in an email never reach the terminal", async () => {
+  const email = makeEmail({
+    fromAddress: "x\x1b]0;window title\x07@example.com",
+    subject: "Invoice\x1b]52;c;ZXZpbA==\x07\x1b[2K\x1b[1A",
+    textBody: "Hello\x1b[2J\r\nsecond line\u009b31m‮",
+    attachments: [{ filename: "a\x1b[31m.pdf", contentType: "application/pdf", size: 1, stored: true, downloadUrl: null }],
+  });
+  api.receive(email);
+  for (const args of [["emails", "list"], ["emails", "get", email.id], ["threads", "get", email.threadId]]) {
+    const r = await run(args);
+    assert.equal(r.code, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /[\x00-\x08\x0b-\x1f\x7f-\x9f‮]/, `${args.join(" ")} printed a control character`);
+  }
+  assert.match((await run(["emails", "get", email.id])).stdout, /Hello\[2J\nsecond line31m/);
+  // --json stays the API's exact data, escaped by JSON itself.
+  const json = JSON.parse((await run(["emails", "get", email.id, "--json"])).stdout);
+  assert.equal(json.subject, email.subject);
+});
+
+test("listen rejects a --header it can't send, before starting", async () => {
+  for (const header of ["Content-Type: text/plain", "x-inboundr-signature: forged", "X Test: a"]) {
+    const r = await run(["listen", "-f", "127.0.0.1:9/inbound", "--header", header]);
+    assert.equal(r.code, 2, header);
+    assert.match(r.stderr, /--header:/);
+  }
+});
+
+test("status --json exits 1 when the key doesn't work, like status does", async () => {
+  const bad = await run(["status", "--json"], { envExtra: { INBOUNDR_API_KEY: "inb_wrong" } });
+  assert.equal(bad.code, 1);
+  assert.equal(JSON.parse(bad.stdout).ok, false);
+  const none = await run(["status", "--json"], { envExtra: { INBOUNDR_API_KEY: "", INBOUNDR_CONFIG_DIR: join(configDir, "none") } });
+  assert.equal(none.code, 1);
+  const good = await run(["status", "--json"]);
+  assert.equal(good.code, 0);
+});
+
+test("global flags work before the command too", async () => {
+  const r = await run(["--json", "domains", "list"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout)[0].domain, "yourdomain.com");
+  const wrong = await run(["--api-key", "inb_wrong", "domains", "list"]);
+  assert.match(wrong.stderr, /Invalid API key/);
+  const bare = await run(["--json"]);
+  assert.equal(bare.code, 0);
+  assert.match(bare.stdout, /Usage/);
+});
+
+test("login saves the origin it checked the key against, replacing an older one", async () => {
+  const dir = join(configDir, "login-origin");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "config.json"), JSON.stringify({ apiKey: "inb_old", baseUrl: "http://127.0.0.1:9" }));
+  const r = await run(["login", "--with-token"], { input: API_KEY, envExtra: { INBOUNDR_API_KEY: "", INBOUNDR_CONFIG_DIR: dir } });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(await readFile(join(dir, "config.json"), "utf8")).baseUrl, api.url);
+});
+
+test("Ctrl-C stops listen at once, even while the server hasn't answered", async () => {
+  let arrived = false;
+  const hung = createServer(() => {
+    arrived = true; // never answers
+  });
+  await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+  const l = startListen(["-f", `127.0.0.1:${hung.address().port}/inbound`, "--interval", "1", "--timeout", "120"], {
+    INBOUNDR_CONFIG_DIR: join(configDir, "hung"),
+  });
+  await l.until(() => l.out.stderr.includes("Ready."));
+  api.receive(makeEmail({ subject: "Slow" }));
+  await l.until(() => arrived);
+  const started = Date.now();
+  l.child.kill("SIGINT");
+  assert.equal(await l.exited, 0);
+  assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`);
+  assert.match(l.out.stderr, /Stopped\./);
+  hung.closeAllConnections();
+  hung.close();
+});
+
+test("listen --json reports fetch failures and rate limits, and retries the email", async () => {
+  const port = await freePort();
+  const got = [];
+  const receiver = createServer(async (req, res) => {
+    let body = "";
+    for await (const c of req) body += c;
+    got.push(JSON.parse(body).email.id);
+    res.writeHead(204).end();
+  });
+  await new Promise((r) => receiver.listen(port, "127.0.0.1", r));
+  const l = startListen(["-f", `127.0.0.1:${port}/inbound`, "--interval", "1", "--json"], { INBOUNDR_CONFIG_DIR: join(configDir, "flaky") });
+  await new Promise((r) => setTimeout(r, 600));
+
+  const email = makeEmail({ subject: "Flaky" });
+  api.failGet.set(email.id, 1);
+  api.receive(email);
+  await l.until(() => got.includes(email.id));
+
+  api.state.rateLimitLists = 1;
+  const after = makeEmail({ subject: "After the 429" });
+  api.receive(after);
+  await l.until(() => got.includes(after.id));
+
+  l.child.kill("SIGINT");
+  assert.equal(await l.exited, 0);
+  receiver.close();
+  const lines = l.out.stdout.trim().split("\n").map((s) => JSON.parse(s));
+  const fetchError = lines.find((x) => x.type === "error" && x.stage === "fetch");
+  assert.equal(fetchError.emailId, email.id);
+  assert.equal(fetchError.gaveUp, false);
+  assert.ok(lines.some((x) => x.type === "error" && /Rate limited/.test(x.error)));
+  assert.deepEqual(lines.filter((x) => x.type === "delivery").map((x) => x.emailId), [email.id, after.id]);
+  assert.equal(got.filter((id) => id === email.id).length, 1, "retried once, delivered once");
 });

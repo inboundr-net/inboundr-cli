@@ -82,6 +82,57 @@ export function newWebhookSecret(): string {
   return `whsec_${randomBytes(24).toString("base64url")}`;
 }
 
+/**
+ * Headers the CLI sets itself, which --header can't replace: the same set the
+ * platform reserves for an endpoint's custom headers. fetch() would otherwise
+ * merge a "Content-Type" or "X-Inboundr-Signature" given in another case into
+ * ours ("text/plain, application/json"), breaking the request or its
+ * signature.
+ */
+export const RESERVED_HEADERS = new Set([
+  "content-type",
+  "content-length",
+  "host",
+  "user-agent",
+  "x-inboundr-event",
+  "x-inboundr-delivery-id",
+  "x-inboundr-email-id",
+  "x-inboundr-id-signature",
+  "x-inboundr-signature",
+  "x-inbound-event",
+  "x-inbound-delivery-id",
+  "x-inbound-signature",
+]);
+
+const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/; // RFC 9110 token
+const HEADER_VALUE = /^[\t\x20-\x7e\x80-\xff]*$/;
+
+/** Why a header can't be sent, or null when it can. */
+export function headerProblem(name: string, value: string): string | null {
+  if (!HEADER_NAME.test(name)) return `"${name}" isn't a valid header name.`;
+  if (RESERVED_HEADERS.has(name.toLowerCase())) return `"${name}" is set by the CLI and can't be overridden.`;
+  if (!HEADER_VALUE.test(value)) return `The value of "${name}" contains characters a header can't carry.`;
+  return null;
+}
+
+/**
+ * Aborts when any of `signals` does. AbortSignal.any where it exists (Node
+ * 20.3+); a manual fallback for the earliest Node 20 releases.
+ */
+export function anySignal(signals: AbortSignal[]): AbortSignal {
+  const any = (AbortSignal as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+  if (any) return any(signals);
+  const controller = new AbortController();
+  for (const s of signals) {
+    if (s.aborted) {
+      controller.abort(s.reason);
+      break;
+    }
+    s.addEventListener("abort", () => controller.abort(s.reason), { once: true });
+  }
+  return controller.signal;
+}
+
 export type ForwardResult = {
   deliveryId: string;
   status: number | null;
@@ -95,7 +146,13 @@ export async function forward(
   url: string,
   email: Email,
   secret: string,
-  options: { timeoutMs: number; userAgent: string; headers?: Record<string, string> },
+  options: {
+    timeoutMs: number;
+    userAgent: string;
+    headers?: Record<string, string>;
+    /** Ctrl-C: abandons a request your server is slow to answer. */
+    signal?: AbortSignal;
+  },
 ): Promise<ForwardResult> {
   const body = JSON.stringify(eventForEmail(email));
   const deliveryId = newDeliveryId();
@@ -105,7 +162,9 @@ export async function forward(
     const res = await fetch(url, {
       method: "POST",
       redirect: "manual",
-      signal: AbortSignal.timeout(options.timeoutMs),
+      signal: options.signal
+        ? anySignal([AbortSignal.timeout(options.timeoutMs), options.signal])
+        : AbortSignal.timeout(options.timeoutMs),
       headers: {
         ...options.headers,
         "content-type": "application/json",

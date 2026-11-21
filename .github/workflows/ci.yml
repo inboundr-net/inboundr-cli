@@ -60,6 +60,22 @@ jobs:
             exit 1
           fi
 
+      # Built here, not left to prepublishOnly: dist/ isn't committed, and a
+      # publish that skipped lifecycle scripts would ship a package whose bin
+      # doesn't exist. The check fails the job instead.
+      - run: npm run build
+      - name: Package must contain the CLI
+        run: |
+          npm pack --dry-run --json > pack.json
+          node -e '
+            const files = require("./pack.json")[0].files.map((f) => f.path);
+            if (!files.includes("dist/cli.js")) {
+              console.error("::error::dist/cli.js is missing from the package");
+              process.exit(1);
+            }
+            console.log(files.length + " files, dist/cli.js included");
+          '
+
       # Staged, not live: it waits on npmjs.com until a maintainer approves
       # it with 2FA.
       - run: npm stage publish --access public

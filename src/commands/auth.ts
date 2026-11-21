@@ -1,9 +1,20 @@
 import { Inboundr } from "inboundr";
 import { configPath, readConfig, writeConfig } from "../config.js";
-import { describeError, resolveCredentials, stringValue, type Command } from "../command.js";
+import { describeError, resolveCredentials, stringValue, type Command, type Values } from "../command.js";
 import { CliError, UsageError } from "../errors.js";
 import { readHidden, readStdin } from "../prompt.js";
 import { bold, dim, green, note, print, printJson, red } from "../output.js";
+
+const DEFAULT_ORIGIN = "https://inboundr.net";
+
+/**
+ * Where login checks a new key: --base-url, then INBOUNDR_BASE_URL, then the
+ * default. Not the saved origin — that belongs to the key being replaced.
+ */
+export function loginBaseUrl(values: Values, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const raw = stringValue(values, "base-url") ?? (env.INBOUNDR_BASE_URL || undefined);
+  return raw?.replace(/\/+$/, "");
+}
 
 /** "inb_AbCd…" — enough to recognise a key, not enough to use it. */
 export function maskKey(key: string): string {
@@ -28,17 +39,21 @@ export const login: Command = {
     if (!key.startsWith("inb_")) throw new CliError("That isn't an Inboundr API key; they start with inb_.");
 
     const config = await readConfig();
-    const { baseUrl } = resolveCredentials({ ...ctx.values, "api-key": key }, config);
+    const baseUrl = loginBaseUrl(ctx.values);
     try {
       // Any read works for both read-only and full-access keys.
       await new Inboundr({ apiKey: key, ...(baseUrl ? { baseUrl } : {}) }).domains.list();
     } catch (err) {
-      throw new CliError(`The key didn't work: ${describeError(err)}`);
+      throw new CliError(`The key didn't work against ${baseUrl ?? DEFAULT_ORIGIN}: ${describeError(err)}`);
     }
-    const flagBase = stringValue(ctx.values, "base-url");
-    await writeConfig({ ...config, apiKey: key, ...(flagBase ? { baseUrl: flagBase.replace(/\/+$/, "") } : {}) });
-    if (ctx.json) return printJson({ saved: configPath(), key: maskKey(key) });
-    note(`${green("Logged in")} with ${maskKey(key)}. Saved to ${configPath()}`);
+    // The key is saved with the origin it was just checked against, and no
+    // other: an origin saved by an earlier login is replaced, not reused.
+    const { baseUrl: _previous, ...rest } = config;
+    await writeConfig({ ...rest, apiKey: key, ...(baseUrl ? { baseUrl } : {}) });
+    if (ctx.json) return printJson({ saved: configPath(), key: maskKey(key), baseUrl: baseUrl ?? DEFAULT_ORIGIN });
+    note(
+      `${green("Logged in")} with ${maskKey(key)}${baseUrl ? ` for ${baseUrl}` : ""}. Saved to ${configPath()}`,
+    );
   },
 };
 
@@ -79,7 +94,10 @@ export const status: Command = {
       }
     }
     if (ctx.json) {
-      return printJson({ key: apiKey ? maskKey(apiKey) : null, source: source ? from[source] : null, baseUrl: origin, ok, error });
+      printJson({ key: apiKey ? maskKey(apiKey) : null, source: source ? from[source] : null, baseUrl: origin, ok, error });
+      // Same exit code as without --json, so `status --json && …` holds.
+      if (!ok) process.exitCode = 1;
+      return;
     }
     if (!apiKey) {
       print("Not logged in. Run inboundr login, or set INBOUNDR_API_KEY.");

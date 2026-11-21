@@ -39,9 +39,34 @@ export function printJson(value: unknown): void {
 const ANSI = /\x1b\[[0-9;]*m/g;
 const visibleLength = (s: string) => s.replace(ANSI, "").length;
 
-/** Cuts to `max` characters, ending in "…" when it had to cut. */
+/*
+ * Text from an email — subject, sender, filenames, body, a server's answer —
+ * is chosen by whoever sent it. Printed raw, an escape sequence in it runs in
+ * the reader's terminal: it can rewrite lines already on screen, set the
+ * window title, or, on terminals that allow OSC 52, write to the clipboard.
+ * So everything that didn't come from this program goes through safe().
+ *
+ * Removed: C0 controls (ESC, BEL, a lone CR that returns to the line start,
+ * backspace…), DEL, C1 controls (U+0080–U+009F, which include an 8-bit CSI),
+ * and the bidirectional overrides that make text display in a different order
+ * from the one it's stored in.
+ */
+const UNSAFE_LINE = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+const UNSAFE_BLOCK = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/** One line of untrusted text: controls removed, whitespace runs collapsed. */
+export function safe(value: string | null | undefined): string {
+  return (value ?? "").replace(/[\t\n\r]+/g, " ").replace(UNSAFE_LINE, "");
+}
+
+/** Untrusted multi-line text, such as an email body: keeps newlines and tabs. */
+export function safeBlock(value: string | null | undefined): string {
+  return (value ?? "").replace(/\r\n?/g, "\n").replace(UNSAFE_BLOCK, "");
+}
+
+/** Cuts to `max` characters, ending in "…" when it had to cut. Also safe(). */
 export function truncate(value: string, max: number): string {
-  const s = value.replace(/\s+/g, " ").trim();
+  const s = safe(value).replace(/\s+/g, " ").trim();
   return s.length > max ? `${s.slice(0, Math.max(0, max - 1))}…` : s;
 }
 

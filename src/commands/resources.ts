@@ -1,6 +1,6 @@
 import { intValue, stringValue, type Command } from "../command.js";
 import { UsageError } from "../errors.js";
-import { dim, formatDate, green, note, print, printJson, red, table, truncate } from "../output.js";
+import { dim, formatDate, green, note, print, printJson, red, safe, table, truncate } from "../output.js";
 
 const yesNo = (v: boolean) => (v ? "yes" : "no");
 
@@ -85,7 +85,7 @@ export const endpointsTest: Command = {
     if (ctx.json) return printJson(result);
     const code = result.status === null ? "no response" : String(result.status);
     print(`${result.ok ? green("OK") : red("Failed")}  ${code}  ${dim(`${result.durationMs} ms`)}`);
-    if (result.error) print(result.error);
+    if (result.error) print(safe(result.error));
     if (result.responseBody) print(dim(truncate(result.responseBody, 400)));
     if (!result.ok) process.exitCode = 1;
   },

@@ -8,7 +8,7 @@ import type { ListEmailsParams, SendEmailParams, ReplyParams } from "inboundr";
 import { intValue, listValue, stringValue, type Command, type Values } from "../command.js";
 import { CliError, UsageError } from "../errors.js";
 import { readStdin } from "../prompt.js";
-import { bold, dim, formatDate, formatList, green, note, print, printJson, table } from "../output.js";
+import { bold, dim, formatDate, formatList, green, note, print, printJson, safe, safeBlock, table } from "../output.js";
 
 const DIRECTIONS = ["inbound", "outbound"] as const;
 const STATUSES = ["delivered", "pending", "failed"] as const;
@@ -124,20 +124,21 @@ export const emailsGet: Command = {
   async run(ctx) {
     const email = await (await ctx.client()).emails.get(ctx.args[0]!);
     if (ctx.json) return printJson(email);
+    // Every value here came from the sender; see safe() in output.ts.
     const row = (label: string, value: string) => print(`${dim(label.padEnd(9))}${value}`);
-    row("From", email.fromAddress ?? "—");
-    row("To", formatList(email.toAddresses));
-    if (email.ccAddresses.length > 0) row("Cc", formatList(email.ccAddresses));
-    row("Subject", bold(email.subject ?? "(no subject)"));
+    row("From", safe(email.fromAddress) || "—");
+    row("To", safe(formatList(email.toAddresses)));
+    if (email.ccAddresses.length > 0) row("Cc", safe(formatList(email.ccAddresses)));
+    row("Subject", bold(safe(email.subject) || "(no subject)"));
     row("Date", formatDate(email.receivedAt));
     row("Id", `${email.id}  ${dim(`thread ${email.threadId}`)}`);
     row("Checks", `spam ${email.spamVerdict ?? "—"}, SPF ${email.spfVerdict ?? "—"}, DKIM ${email.dkimVerdict ?? "—"}`);
     email.attachments.forEach((a, i) =>
-      row(i === 0 ? "Files" : "", `${i}: ${a.filename ?? "(unnamed)"} ${dim(`(${a.contentType}, ${a.size} bytes)`)}`),
+      row(i === 0 ? "Files" : "", `${i}: ${safe(a.filename) || "(unnamed)"} ${dim(`(${safe(a.contentType)}, ${a.size} bytes)`)}`),
     );
     print();
     const body = ctx.values.html ? email.htmlBody : (email.textBody ?? email.htmlBody);
-    print(body?.trimEnd() || dim("(empty body)"));
+    print(safeBlock(body).trimEnd() || dim("(empty body)"));
   },
 };
 

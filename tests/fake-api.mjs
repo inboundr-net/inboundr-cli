@@ -50,6 +50,10 @@ export async function startFakeApi() {
   const emails = [];
   const requests = [];
   const sent = [];
+  /** Email id → how many more GETs of it should fail with a 500. */
+  const failGet = new Map();
+  /** Answer the next N list calls with a 429 (Retry-After: 1). */
+  const state = { rateLimitLists: 0 };
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://x");
     requests.push(`${req.method} ${url.pathname}${url.search}`);
@@ -63,6 +67,11 @@ export async function startFakeApi() {
     const p = url.pathname.replace(/^\/api\/v1/, "");
     let m;
     if (req.method === "GET" && p === "/emails") {
+      if (state.rateLimitLists > 0) {
+        state.rateLimitLists--;
+        res.writeHead(429, { "content-type": "application/json", "retry-after": "1" });
+        return res.end(JSON.stringify({ error: "Maximum 5 requests per second allowed." }));
+      }
       let list = emails;
       const dir = url.searchParams.get("direction");
       if (dir) list = list.filter((e) => e.direction === dir);
@@ -74,6 +83,11 @@ export async function startFakeApi() {
       return json(200, { data: page.map(summary), nextCursor: start + limit < list.length ? String(start + limit) : null });
     }
     if (req.method === "GET" && (m = p.match(/^\/emails\/([^/]+)$/))) {
+      const left = failGet.get(m[1]) ?? 0;
+      if (left > 0) {
+        failGet.set(m[1], left - 1);
+        return json(500, { error: "Internal error" });
+      }
       const e = emails.find((x) => x.id === m[1]);
       return e ? json(200, e) : json(404, { error: "Not found" });
     }
@@ -89,6 +103,9 @@ export async function startFakeApi() {
       sent.push(JSON.parse(body));
       return json(201, { id: "em_sent", messageId: "<s@x>", threadId: "thr_2" });
     }
+    if (req.method === "GET" && (m = p.match(/^\/threads\/([^/]+)$/))) {
+      return json(200, { threadId: m[1], data: emails.filter((e) => e.threadId === m[1]).map(summary) });
+    }
     if (req.method === "GET" && p === "/domains") {
       return json(200, { data: [{ id: "dom_1", domain: "yourdomain.com", status: "verified", state: "active" }] });
     }
@@ -101,6 +118,8 @@ export async function startFakeApi() {
     emails,
     requests,
     sent,
+    failGet,
+    state,
     /** Adds emails as if they just arrived. */
     receive(...items) {
       emails.unshift(...items.reverse());

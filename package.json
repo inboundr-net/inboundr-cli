@@ -1,6 +1,6 @@
 {
   "name": "@inboundr/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The Inboundr command line: forward inbound email to localhost, and read, reply to and send email from your terminal.",
   "license": "MIT",
   "author": "inboundr <dev@inboundr.net>",
@@ -30,7 +30,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json && chmod +x dist/cli.js",
-    "test": "npm run build && node --test tests/*.test.mjs",
+    "test": "npm run build && node --test --test-timeout=30000 tests/*.test.mjs",
     "prepublishOnly": "npm test"
   },
   "dependencies": {

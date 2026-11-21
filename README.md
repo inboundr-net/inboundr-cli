@@ -53,10 +53,16 @@ echo "INBOUNDR_WEBHOOK_SECRET=$(inboundr listen --print-secret)" >> .env
 - `--secret whsec_…` signs with your own secret instead, e.g. your real
   endpoint's.
 - `--header "Authorization: Bearer …"` adds a header to every request.
-- `--json` prints one JSON line per delivery, for scripts.
+- `--json` prints one JSON line per event, for scripts: `"type": "delivery"`
+  for each email forwarded, `"type": "error"` when checking for or fetching
+  email failed.
+- `--header` can't replace the headers the CLI sets itself (`content-type`,
+  `user-agent`, the `x-inboundr-*` ones).
 
 `listen` checks for new email every 2 seconds (`--interval`) and forwards
-what arrives after it starts. Your real endpoints keep receiving deliveries as
+what arrives after it starts. An email it couldn't fetch is tried again on the
+next checks. Text from emails (subjects, senders, bodies) is printed with
+terminal control characters removed; `--json` output is the API's data as-is. Your real endpoints keep receiving deliveries as
 usual. A delivery your server answers with an error is shown, not retried; use
 `inboundr emails retry <id>` to deliver an email to your real endpoints again.
 

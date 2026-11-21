@@ -1,9 +1,9 @@
 import { InboundrApiError, InboundrRateLimitError, type EmailSummary, type ListEmailsParams } from "inboundr";
 import { writeConfig } from "../config.js";
 import { describeError, intValue, stringValue, type Command } from "../command.js";
-import { forward, newWebhookSecret, type ForwardResult } from "../delivery.js";
+import { anySignal, forward, headerProblem, newWebhookSecret, type ForwardResult } from "../delivery.js";
 import { UsageError } from "../errors.js";
-import { bold, cyan, dim, formatTime, green, note, print, red, truncate, yellow } from "../output.js";
+import { bold, cyan, dim, formatTime, green, note, print, red, safe, truncate, yellow } from "../output.js";
 import { USER_AGENT } from "../version.js";
 
 /** How many ids to remember; far more than can arrive between two polls. */
@@ -11,6 +11,8 @@ const SEEN_LIMIT = 5000;
 /** Pages to walk in one poll before giving up on catching up. */
 const MAX_PAGES = 10;
 const PAGE_SIZE = 50;
+/** Tries at fetching one email before listen reports it and moves on. */
+const MAX_FETCH_ATTEMPTS = 3;
 
 function parseUrl(value: string): URL {
   let url: URL;
@@ -30,7 +32,13 @@ function parseHeaders(values: string[] | undefined): Record<string, string> {
   for (const raw of values ?? []) {
     const i = raw.indexOf(":");
     if (i <= 0) throw new UsageError(`--header must look like "Name: value", got: ${raw}`);
-    headers[raw.slice(0, i).trim()] = raw.slice(i + 1).trim();
+    const name = raw.slice(0, i).trim();
+    const value = raw.slice(i + 1).trim();
+    // Checked here, so a bad one is a usage error now rather than a failed
+    // delivery for every email later.
+    const problem = headerProblem(name, value);
+    if (problem) throw new UsageError(`--header: ${problem}`);
+    headers[name] = value;
   }
   return headers;
 }
@@ -116,7 +124,14 @@ export const listen: Command = {
     const timeoutMs = (intValue(values, "timeout", { min: 1, max: 120 }) ?? 30) * 1000;
     const to = stringValue(values, "to");
 
-    const client = await ctx.client();
+    // Ctrl-C aborts this, which cancels whatever request is in flight —
+    // an API call or a forward your server is slow to answer — instead of
+    // waiting out its timeout.
+    const stop = new AbortController();
+    const client = await ctx.client({
+      fetch: (input, init) =>
+        fetch(input, { ...init, signal: init?.signal ? anySignal([init.signal, stop.signal]) : stop.signal }),
+    });
     const params: ListEmailsParams = { direction: "inbound", limit: PAGE_SIZE, ...(to ? { to } : {}) };
 
     // Everything already stored counts as seen: listen forwards what arrives
@@ -129,10 +144,15 @@ export const listen: Command = {
     const baseline = await client.emails.list(params);
     for (const e of baseline.data) remember(e.id);
 
-    const stop = new AbortController();
     const onSignal = () => stop.abort();
     process.once("SIGINT", onSignal);
     process.once("SIGTERM", onSignal);
+
+    /** A problem worth telling the user about; a JSON line in --json mode. */
+    const warn = (error: string, extra: Record<string, unknown> = {}) => {
+      if (ctx.json) print(JSON.stringify({ type: "error", ...extra, error }));
+      else note(yellow(error));
+    };
 
     if (!ctx.json) {
       note(`${green("Ready.")} Forwarding new inbound email${to ? ` to ${bold(to)}` : ""} to ${bold(url)}`);
@@ -142,45 +162,78 @@ export const listen: Command = {
     }
 
     let failures = 0;
+    let skipSleep = false;
+    const fetchFailures = new Map<string, number>();
     try {
       while (!stop.signal.aborted) {
-        await sleep(failures > 0 ? Math.min(intervalMs * 2 ** failures, 60_000) : intervalMs, stop.signal);
+        if (!skipSleep) {
+          await sleep(failures > 0 ? Math.min(intervalMs * 2 ** failures, 60_000) : intervalMs, stop.signal);
+        }
+        skipSleep = false;
         if (stop.signal.aborted) break;
 
-        let fresh: EmailSummary[];
+        let batch: { fresh: EmailSummary[]; complete: boolean };
         try {
-          fresh = await newEmails(client.emails.list.bind(client.emails), params, seen);
+          batch = await newEmails(client.emails.list.bind(client.emails), params, seen);
           failures = 0;
         } catch (err) {
+          if (stop.signal.aborted) break;
           if (err instanceof InboundrApiError && (err.status === 401 || err.status === 403)) throw err;
           if (err instanceof InboundrRateLimitError && err.retryAfterSeconds) {
+            // Wait exactly as long as the API asked, then check straight
+            // away: a 429 with an answer isn't a failure to back off from.
+            warn(`Rate limited; checking again in ${err.retryAfterSeconds}s.`, { stage: "list" });
             await sleep(err.retryAfterSeconds * 1000, stop.signal);
+            skipSleep = true;
+            continue;
           }
           failures++;
-          if (!ctx.json) note(yellow(`Couldn't check for new email: ${describeError(err)} Retrying.`));
+          warn(`Couldn't check for new email: ${safe(describeError(err))} Retrying.`, { stage: "list" });
           continue;
+        }
+        if (!batch.complete) {
+          warn(
+            `More than ${MAX_PAGES * PAGE_SIZE} new emails arrived since the last check. Forwarding the newest ${MAX_PAGES * PAGE_SIZE}; older ones are skipped.`,
+            { stage: "list" },
+          );
         }
 
         // Oldest first, the order they arrived in.
-        for (const summary of fresh.reverse()) {
+        for (const summary of batch.fresh.reverse()) {
           if (stop.signal.aborted) break;
-          // Marked before forwarding: a handler that fails is reported, not
-          // sent the same email on every poll.
-          remember(summary.id);
           let email;
           try {
             email = await client.emails.get(summary.id);
           } catch (err) {
-            if (!ctx.json) note(yellow(`Couldn't fetch ${summary.id}: ${describeError(err)}`));
+            if (stop.signal.aborted) break;
+            // Left unseen, so the next check tries it again — a few times.
+            const attempts = (fetchFailures.get(summary.id) ?? 0) + 1;
+            const giveUp = attempts >= MAX_FETCH_ATTEMPTS;
+            if (giveUp) {
+              fetchFailures.delete(summary.id);
+              remember(summary.id);
+            } else {
+              fetchFailures.set(summary.id, attempts);
+            }
+            warn(
+              `Couldn't fetch ${summary.id}: ${safe(describeError(err))}${giveUp ? " Skipping it." : " Trying again on the next check."}`,
+              { stage: "fetch", emailId: summary.id, gaveUp: giveUp },
+            );
             continue;
           }
+          fetchFailures.delete(summary.id);
+          // Marked before forwarding: a handler that fails is reported, not
+          // sent the same email on every poll.
+          remember(summary.id);
           const result = await forward(url, email, secret, {
             timeoutMs,
             userAgent: `${USER_AGENT} (listen)`,
             headers,
+            signal: stop.signal,
           });
+          if (stop.signal.aborted) break;
           if (ctx.json) {
-            print(JSON.stringify({ emailId: email.id, ...result }));
+            print(JSON.stringify({ type: "delivery", emailId: email.id, ...result }));
           } else {
             print(
               `${dim(formatTime(new Date()))}  ${email.id}  ${truncate(email.fromAddress ?? "", 32)}  ${truncate(email.subject ?? "(no subject)", 40)}  →  ${describeResult(result)}`,
@@ -198,13 +251,14 @@ export const listen: Command = {
 
 /**
  * The inbound emails not seen yet, newest first. Walks pages until it reaches
- * one it has seen, so a burst larger than a page isn't missed.
+ * one it has seen, so a burst larger than a page isn't missed. `complete` is
+ * false when it stopped at the page limit with older unseen email left.
  */
 export async function newEmails(
   list: (p: ListEmailsParams) => Promise<{ data: EmailSummary[]; nextCursor: string | null }>,
   params: ListEmailsParams,
   seen: Set<string>,
-): Promise<EmailSummary[]> {
+): Promise<{ fresh: EmailSummary[]; complete: boolean }> {
   const fresh: EmailSummary[] = [];
   let cursor: string | undefined;
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -214,8 +268,8 @@ export async function newEmails(
       if (seen.has(e.id)) reachedSeen = true;
       else fresh.push(e);
     }
-    if (reachedSeen || !res.nextCursor) break;
+    if (reachedSeen || !res.nextCursor) return { fresh, complete: true };
     cursor = res.nextCursor;
   }
-  return fresh;
+  return { fresh, complete: false };
 }
