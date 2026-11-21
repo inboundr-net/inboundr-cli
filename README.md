@@ -4,13 +4,29 @@ The command line for [Inboundr](https://inboundr.net). Forward inbound email to
 your local server as signed webhook deliveries, and read, reply to and send
 email from your terminal.
 
+## Install
+
+Node.js 20 or later.
+
 ```bash
 npm install -g @inboundr/cli
-# or, without installing
+inboundr --help
+```
+
+Or run it without installing:
+
+```bash
 npx @inboundr/cli --help
 ```
 
-Node.js 20 or later.
+With `npx`, put `npx @inboundr/cli` wherever this README says `inboundr`.
+Nothing is installed, and each run uses the latest version.
+
+If `npm install -g` fails with `EACCES: permission denied`, your global
+packages folder is owned by root, as it is after installing Node from
+nodejs.org. Use `npx`, or move npm's global folder into your home directory
+as in [npm's guide](https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally).
+Don't use `sudo`.
 
 ## Log in
 
