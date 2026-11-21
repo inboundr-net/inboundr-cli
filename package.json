@@ -1,0 +1,43 @@
+{
+  "name": "@inboundr/cli",
+  "version": "0.1.0",
+  "description": "The Inboundr command line: forward inbound email to localhost, and read, reply to and send email from your terminal.",
+  "license": "MIT",
+  "author": "inboundr <dev@inboundr.net>",
+  "homepage": "https://inboundr.net/docs/sdks/cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inboundr-net/inboundr-cli.git"
+  },
+  "bugs": "https://github.com/inboundr-net/inboundr-cli/issues",
+  "keywords": [
+    "email",
+    "inbound-email",
+    "webhook",
+    "cli",
+    "inboundr"
+  ],
+  "type": "module",
+  "bin": {
+    "inboundr": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "dependencies": {
+    "inboundr": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.25",
+    "typescript": "5.9.3"
+  }
+}

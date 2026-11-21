@@ -1,0 +1,7 @@
+node_modules/
+
+# Build output. Published to npm from CI, never committed.
+dist/
+
+.DS_Store
+npm-debug.log*
